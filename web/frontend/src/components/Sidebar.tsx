@@ -20,7 +20,7 @@ const repoNavItems = [
   { suffix: '/agents', icon: Bot, label: 'AI Agents' },
   { suffix: '/docs', icon: FileText, label: 'Documents' },
   { suffix: '/practices', icon: ShieldCheck, label: 'Best Practices' },
-  { suffix: '/pipelines', icon: Workflow, label: 'Pipelines' },
+  { suffix: '/workflows', icon: Workflow, label: 'Workflows' },
 ]
 
 interface SidebarProps {

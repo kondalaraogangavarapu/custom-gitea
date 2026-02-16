@@ -75,6 +75,27 @@ export interface BlobContent {
   path: string
 }
 
+export interface WorkflowRun {
+  id: number
+  repo_id: number
+  user_id: number
+  triggered_by: string
+  section: string
+  status: 'pending' | 'running' | 'completed' | 'failed'
+  step_results: StepResult[]
+  summary: string
+  started_at: string | null
+  completed_at: string | null
+  created_at: string
+}
+
+export interface StepResult {
+  step: string
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped'
+  output: string
+  task_id?: number
+}
+
 export interface PracticeItem {
   rule: string
   description: string

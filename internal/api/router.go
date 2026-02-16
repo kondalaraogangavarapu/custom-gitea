@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -91,7 +92,7 @@ func NewRouter(cfg *config.Config) (http.Handler, error) {
 		r.Get("/{owner}/{repo}/mindmaps", h.serveSPA)
 		r.Get("/{owner}/{repo}/docs", h.serveSPA)
 		r.Get("/{owner}/{repo}/practices", h.serveSPA)
-		r.Get("/{owner}/{repo}/pipelines", h.serveSPA)
+		r.Get("/{owner}/{repo}/workflows", h.serveSPA)
 	})
 
 	// API (JSON)
@@ -116,6 +117,16 @@ func NewRouter(cfg *config.Config) (http.Handler, error) {
 
 		// Best practices
 		r.Get("/repos/{owner}/{repo}/practices", h.apiAnalyzePractices)
+
+		// Workflows — plain-English file stored in the repo at .aetherdev/workflows.md
+		r.Get("/repos/{owner}/{repo}/workflows/file", h.apiGetWorkflowFile)
+		r.Put("/repos/{owner}/{repo}/workflows/file", h.apiSaveWorkflowFile)
+
+		// Workflow runs — observability for agent-executed workflow steps
+		r.Get("/repos/{owner}/{repo}/workflows/runs", h.apiListWorkflowRuns)
+		r.Post("/repos/{owner}/{repo}/workflows/runs", h.apiCreateWorkflowRun)
+		r.Get("/repos/{owner}/{repo}/workflows/runs/{runID}", h.apiGetWorkflowRun)
+		r.Put("/repos/{owner}/{repo}/workflows/runs/{runID}", h.apiUpdateWorkflowRun)
 
 		// System
 		r.Get("/health", h.apiHealth)
@@ -498,11 +509,198 @@ func (h *Handler) pagePractices(w http.ResponseWriter, r *http.Request) {
 	h.render(w, "practices", data)
 }
 
-func (h *Handler) pagePipelines(w http.ResponseWriter, r *http.Request) {
-	data := h.newPageData("Pipelines")
-	data.Owner = chi.URLParam(r, "owner")
-	data.RepoName = chi.URLParam(r, "repo")
-	h.render(w, "pipelines", data)
+// workflowFilePath is the conventional location for the plain-English workflow file.
+const workflowFilePath = ".aetherdev/workflows.md"
+
+// apiGetWorkflowFile reads the workflow file from the repo. If it doesn't exist
+// yet, returns a starter template so the user (or agent) knows the format.
+func (h *Handler) apiGetWorkflowFile(w http.ResponseWriter, r *http.Request) {
+	owner := chi.URLParam(r, "owner")
+	repoName := chi.URLParam(r, "repo")
+
+	content, err := h.gitEngine.ReadBlob(owner, repoName, "main", workflowFilePath)
+	if err != nil {
+		// File doesn't exist yet — return empty with exists=false
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"path":    workflowFilePath,
+			"content": "",
+			"exists":  false,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"path":    workflowFilePath,
+		"content": string(content),
+		"exists":  true,
+	})
+}
+
+// apiSaveWorkflowFile writes the workflow file into the repo as a git commit.
+func (h *Handler) apiSaveWorkflowFile(w http.ResponseWriter, r *http.Request) {
+	owner := chi.URLParam(r, "owner")
+	repoName := chi.URLParam(r, "repo")
+
+	var input struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	commitSHA, err := h.gitEngine.WriteFile(
+		owner, repoName, "main",
+		workflowFilePath, input.Content,
+		"Update AetherDev workflows", "AetherDev Agent", "agent@aetherdev.local",
+	)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save workflow file: " + err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"path":       workflowFilePath,
+		"commit_sha": commitSHA,
+	})
+}
+
+// apiListWorkflowRuns returns the run history for a repo's workflows.
+func (h *Handler) apiListWorkflowRuns(w http.ResponseWriter, r *http.Request) {
+	owner := chi.URLParam(r, "owner")
+	repoName := chi.URLParam(r, "repo")
+
+	user, err := h.store.GetUserByUsername(owner)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "owner not found"})
+		return
+	}
+	repo, err := h.store.GetRepository(user.ID, repoName)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "repository not found"})
+		return
+	}
+
+	runs, err := h.store.ListWorkflowRuns(repo.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if runs == nil {
+		runs = []models.WorkflowRun{}
+	}
+	writeJSON(w, http.StatusOK, runs)
+}
+
+// apiCreateWorkflowRun records a new workflow execution.
+func (h *Handler) apiCreateWorkflowRun(w http.ResponseWriter, r *http.Request) {
+	owner := chi.URLParam(r, "owner")
+	repoName := chi.URLParam(r, "repo")
+
+	user, err := h.store.GetUserByUsername(owner)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "owner not found"})
+		return
+	}
+	repo, err := h.store.GetRepository(user.ID, repoName)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "repository not found"})
+		return
+	}
+
+	var input struct {
+		TriggeredBy string              `json:"triggered_by"`
+		Section     string              `json:"section"`
+		Status      string              `json:"status"`
+		StepResults []models.StepResult `json:"step_results"`
+		Summary     string              `json:"summary"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	now := time.Now()
+	run := &models.WorkflowRun{
+		RepoID:      repo.ID,
+		UserID:      user.ID,
+		TriggerBy:   input.TriggeredBy,
+		Section:     input.Section,
+		Status:      input.Status,
+		StepResults: input.StepResults,
+		Summary:     input.Summary,
+		StartedAt:   &now,
+	}
+	if run.Status == "" {
+		run.Status = "pending"
+	}
+	if err := h.store.CreateWorkflowRun(run); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, run)
+}
+
+// apiGetWorkflowRun returns a single workflow run with step-level detail.
+func (h *Handler) apiGetWorkflowRun(w http.ResponseWriter, r *http.Request) {
+	runIDStr := chi.URLParam(r, "runID")
+	runID, err := strconv.ParseInt(runIDStr, 10, 64)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid run ID"})
+		return
+	}
+
+	run, err := h.store.GetWorkflowRun(runID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "workflow run not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, run)
+}
+
+// apiUpdateWorkflowRun updates a workflow run (status, step results, summary).
+func (h *Handler) apiUpdateWorkflowRun(w http.ResponseWriter, r *http.Request) {
+	runIDStr := chi.URLParam(r, "runID")
+	runID, err := strconv.ParseInt(runIDStr, 10, 64)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid run ID"})
+		return
+	}
+
+	run, err := h.store.GetWorkflowRun(runID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "workflow run not found"})
+		return
+	}
+
+	var input struct {
+		Status      string              `json:"status"`
+		StepResults []models.StepResult `json:"step_results"`
+		Summary     string              `json:"summary"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	if input.Status != "" {
+		run.Status = input.Status
+	}
+	if input.StepResults != nil {
+		run.StepResults = input.StepResults
+	}
+	if input.Summary != "" {
+		run.Summary = input.Summary
+	}
+	if run.Status == "completed" || run.Status == "failed" {
+		now := time.Now()
+		run.CompletedAt = &now
+	}
+
+	if err := h.store.UpdateWorkflowRun(run); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, run)
 }
 
 // serveSPA serves the Vite-built SPA index.html for all client-side routes.

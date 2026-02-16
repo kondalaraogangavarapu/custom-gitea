@@ -8,6 +8,7 @@ import {
   Bot,
   FileText,
   ShieldCheck,
+  Workflow,
 } from 'lucide-react'
 import { repos } from '../lib/api'
 import type { TreeEntry } from '../types'
@@ -68,6 +69,7 @@ export default function Repository() {
           { to: `/${owner}/${repo}/agents`, label: 'AI Agents', icon: Bot },
           { to: `/${owner}/${repo}/docs`, label: 'Docs', icon: FileText },
           { to: `/${owner}/${repo}/practices`, label: 'Practices', icon: ShieldCheck },
+          { to: `/${owner}/${repo}/workflows`, label: 'Workflows', icon: Workflow },
         ].map((tab) => (
           <Link
             key={tab.to}

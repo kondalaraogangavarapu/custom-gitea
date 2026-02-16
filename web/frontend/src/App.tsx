@@ -8,6 +8,7 @@ import BlobViewer from './pages/BlobViewer'
 import Agents from './pages/Agents'
 import Docs from './pages/Docs'
 import Practices from './pages/Practices'
+import Workflows from './pages/Workflows'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -31,6 +32,7 @@ export default function App() {
             <Route path="/:owner/:repo/agents" element={<Agents />} />
             <Route path="/:owner/:repo/docs" element={<Docs />} />
             <Route path="/:owner/:repo/practices" element={<Practices />} />
+            <Route path="/:owner/:repo/workflows" element={<Workflows />} />
           </Route>
         </Routes>
       </BrowserRouter>

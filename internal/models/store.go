@@ -2,6 +2,7 @@ package models
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -91,14 +92,18 @@ func (s *Store) migrate() error {
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
-		`CREATE TABLE IF NOT EXISTS pipelines (
+		`CREATE TABLE IF NOT EXISTS workflow_runs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			repo_id INTEGER NOT NULL REFERENCES repositories(id),
-			name TEXT NOT NULL,
-			status TEXT DEFAULT 'idle',
-			stages_json TEXT DEFAULT '[]',
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+			user_id INTEGER NOT NULL REFERENCES users(id),
+			triggered_by TEXT DEFAULT '',
+			section TEXT DEFAULT '',
+			status TEXT DEFAULT 'pending',
+			step_results_json TEXT DEFAULT '[]',
+			summary TEXT DEFAULT '',
+			started_at DATETIME,
+			completed_at DATETIME,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
 		// Seed a default admin user for v1
 		`INSERT OR IGNORE INTO users (id, username, email, full_name, is_admin)
@@ -264,4 +269,76 @@ func (s *Store) ListDocuments(repoID int64) ([]Document, error) {
 		docs = append(docs, d)
 	}
 	return docs, nil
+}
+
+// --- Workflow run operations ---
+
+func (s *Store) CreateWorkflowRun(r *WorkflowRun) error {
+	resultsJSON, err := json.Marshal(r.StepResults)
+	if err != nil {
+		return fmt.Errorf("marshal step_results: %w", err)
+	}
+	res, err := s.db.Exec(
+		`INSERT INTO workflow_runs (repo_id, user_id, triggered_by, section, status, step_results_json, summary, started_at)
+		 VALUES (?,?,?,?,?,?,?,?)`,
+		r.RepoID, r.UserID, r.TriggerBy, r.Section, r.Status, string(resultsJSON), r.Summary, r.StartedAt,
+	)
+	if err != nil {
+		return err
+	}
+	r.ID, _ = res.LastInsertId()
+	r.CreatedAt = time.Now()
+	return nil
+}
+
+func (s *Store) UpdateWorkflowRun(r *WorkflowRun) error {
+	resultsJSON, err := json.Marshal(r.StepResults)
+	if err != nil {
+		return fmt.Errorf("marshal step_results: %w", err)
+	}
+	_, err = s.db.Exec(
+		`UPDATE workflow_runs SET status=?, step_results_json=?, summary=?, started_at=?, completed_at=? WHERE id=?`,
+		r.Status, string(resultsJSON), r.Summary, r.StartedAt, r.CompletedAt, r.ID,
+	)
+	return err
+}
+
+func (s *Store) GetWorkflowRun(id int64) (*WorkflowRun, error) {
+	r := &WorkflowRun{}
+	var resultsJSON string
+	err := s.db.QueryRow(
+		`SELECT id, repo_id, user_id, triggered_by, section, status, step_results_json, summary, started_at, completed_at, created_at
+		 FROM workflow_runs WHERE id=?`, id,
+	).Scan(&r.ID, &r.RepoID, &r.UserID, &r.TriggerBy, &r.Section, &r.Status, &resultsJSON, &r.Summary, &r.StartedAt, &r.CompletedAt, &r.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(resultsJSON), &r.StepResults); err != nil {
+		return nil, fmt.Errorf("unmarshal step_results: %w", err)
+	}
+	return r, nil
+}
+
+func (s *Store) ListWorkflowRuns(repoID int64) ([]WorkflowRun, error) {
+	rows, err := s.db.Query(
+		`SELECT id, repo_id, user_id, triggered_by, section, status, step_results_json, summary, started_at, completed_at, created_at
+		 FROM workflow_runs WHERE repo_id=? ORDER BY created_at DESC LIMIT 50`, repoID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var runs []WorkflowRun
+	for rows.Next() {
+		var r WorkflowRun
+		var resultsJSON string
+		if err := rows.Scan(&r.ID, &r.RepoID, &r.UserID, &r.TriggerBy, &r.Section, &r.Status, &resultsJSON, &r.Summary, &r.StartedAt, &r.CompletedAt, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(resultsJSON), &r.StepResults); err != nil {
+			return nil, fmt.Errorf("unmarshal step_results: %w", err)
+		}
+		runs = append(runs, r)
+	}
+	return runs, nil
 }

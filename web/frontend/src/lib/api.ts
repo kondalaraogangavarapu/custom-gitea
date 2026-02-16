@@ -6,6 +6,8 @@ import type {
   CommitInfo,
   BlobContent,
   BestPracticeReport,
+  WorkflowRun,
+  StepResult,
 } from '../types'
 
 const BASE = '/api/v1'
@@ -68,6 +70,47 @@ export const agents = {
 export const docs = {
   list: (owner: string, repo: string) =>
     request<Document[]>(`/repos/${owner}/${repo}/documents`),
+}
+
+// Workflows — plain-English file in the repo
+export const workflows = {
+  getFile: (owner: string, repo: string) =>
+    request<{ path: string; content: string; exists: boolean }>(
+      `/repos/${owner}/${repo}/workflows/file`
+    ),
+
+  saveFile: (owner: string, repo: string, content: string) =>
+    request<{ path: string; commit_sha: string }>(
+      `/repos/${owner}/${repo}/workflows/file`,
+      { method: 'PUT', body: JSON.stringify({ content }) }
+    ),
+
+  listRuns: (owner: string, repo: string) =>
+    request<WorkflowRun[]>(`/repos/${owner}/${repo}/workflows/runs`),
+
+  createRun: (
+    owner: string,
+    repo: string,
+    data: { triggered_by: string; section: string; step_results?: StepResult[] }
+  ) =>
+    request<WorkflowRun>(`/repos/${owner}/${repo}/workflows/runs`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  getRun: (owner: string, repo: string, runId: number) =>
+    request<WorkflowRun>(`/repos/${owner}/${repo}/workflows/runs/${runId}`),
+
+  updateRun: (
+    owner: string,
+    repo: string,
+    runId: number,
+    data: { status?: string; step_results?: StepResult[]; summary?: string }
+  ) =>
+    request<WorkflowRun>(`/repos/${owner}/${repo}/workflows/runs/${runId}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
 }
 
 // Best Practices

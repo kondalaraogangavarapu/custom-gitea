@@ -161,3 +161,81 @@ func (e *Engine) CreateBranch(owner, name, branch, baseRef string) error {
 	}
 	return nil
 }
+
+// WriteFile commits a file into a bare repository using git plumbing commands.
+// It writes the blob, creates a tree, and commits it onto the given branch.
+func (e *Engine) WriteFile(owner, name, branch, filePath, content, commitMsg, authorName, authorEmail string) (string, error) {
+	repoPath := e.RepoPath(owner, name)
+
+	// 1. Write blob object
+	hashObj := exec.Command("git", "-C", repoPath, "hash-object", "-w", "--stdin")
+	hashObj.Stdin = strings.NewReader(content)
+	blobSHA, err := hashObj.Output()
+	if err != nil {
+		return "", fmt.Errorf("hash-object: %w", err)
+	}
+	blobRef := strings.TrimSpace(string(blobSHA))
+
+	// 2. Read existing tree (if branch exists), otherwise start empty
+	var treeContent string
+	existingTree := exec.Command("git", "-C", repoPath, "ls-tree", branch)
+	if out, err := existingTree.Output(); err == nil {
+		// Filter out the old entry for this file path, keep everything else
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			if line == "" {
+				continue
+			}
+			// Each line: "mode type sha\tname"
+			if idx := strings.Index(line, "\t"); idx >= 0 {
+				entryName := line[idx+1:]
+				if entryName == filePath {
+					continue // skip old version of this file
+				}
+			}
+			treeContent += line + "\n"
+		}
+	}
+
+	// Add the new/updated file entry
+	treeContent += fmt.Sprintf("100644 blob %s\t%s\n", blobRef, filePath)
+
+	// 3. Create tree object
+	mkTree := exec.Command("git", "-C", repoPath, "mktree")
+	mkTree.Stdin = strings.NewReader(treeContent)
+	treeSHA, err := mkTree.Output()
+	if err != nil {
+		return "", fmt.Errorf("mktree: %w", err)
+	}
+	treeRef := strings.TrimSpace(string(treeSHA))
+
+	// 4. Create commit object
+	env := []string{
+		"GIT_AUTHOR_NAME=" + authorName,
+		"GIT_AUTHOR_EMAIL=" + authorEmail,
+		"GIT_COMMITTER_NAME=" + authorName,
+		"GIT_COMMITTER_EMAIL=" + authorEmail,
+	}
+
+	commitArgs := []string{"-C", repoPath, "commit-tree", treeRef, "-m", commitMsg}
+	// If branch exists, set it as parent
+	parentSHA := exec.Command("git", "-C", repoPath, "rev-parse", "--verify", branch)
+	if parentOut, err := parentSHA.Output(); err == nil {
+		commitArgs = append(commitArgs, "-p", strings.TrimSpace(string(parentOut)))
+	}
+
+	commitCmd := exec.Command("git", commitArgs...)
+	commitCmd.Env = append(os.Environ(), env...)
+	commitSHA, err := commitCmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("commit-tree: %w", err)
+	}
+	commitRef := strings.TrimSpace(string(commitSHA))
+
+	// 5. Update branch ref
+	updateRef := exec.Command("git", "-C", repoPath, "update-ref", "refs/heads/"+branch, commitRef)
+	if out, err := updateRef.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("update-ref: %s: %w", string(out), err)
+	}
+
+	return commitRef, nil
+}

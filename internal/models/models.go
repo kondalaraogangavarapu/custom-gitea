@@ -82,23 +82,28 @@ type MapNode struct {
 	Children []*MapNode `json:"children,omitempty"`
 }
 
-// Pipeline represents a CI/CD pipeline definition.
-type Pipeline struct {
-	ID        int64          `json:"id"`
-	RepoID    int64          `json:"repo_id"`
-	Name      string         `json:"name"`
-	Status    string         `json:"status"` // idle, running, passed, failed
-	Stages    []PipelineStage `json:"stages"`
-	CreatedAt time.Time      `json:"created_at"`
-	UpdatedAt time.Time      `json:"updated_at"`
+// WorkflowRun records a single execution of the repo's workflow file by an AI agent.
+// The workflow definition lives in .aetherdev/workflows.md — this only tracks runs.
+type WorkflowRun struct {
+	ID          int64        `json:"id"`
+	RepoID      int64        `json:"repo_id"`
+	UserID      int64        `json:"user_id"`
+	TriggerBy   string       `json:"triggered_by"` // username or "agent" who initiated the run
+	Section     string       `json:"section"`       // which workflow section was run, e.g. "On every pull request"
+	Status      string       `json:"status"`        // pending, running, completed, failed
+	StepResults []StepResult `json:"step_results"`
+	Summary     string       `json:"summary"`  // agent's summary of the overall outcome
+	StartedAt   *time.Time   `json:"started_at"`
+	CompletedAt *time.Time   `json:"completed_at"`
+	CreatedAt   time.Time    `json:"created_at"`
 }
 
-// PipelineStage is a stage within a pipeline.
-type PipelineStage struct {
-	Name     string `json:"name"`
-	Status   string `json:"status"`
-	Duration int    `json:"duration_seconds"`
-	LogURL   string `json:"log_url"`
+// StepResult captures what the agent did for a single workflow step.
+type StepResult struct {
+	Step   string `json:"step"`   // the plain-English step text from the workflow file
+	Status string `json:"status"` // pending, running, completed, failed, skipped
+	Output string `json:"output"` // what the agent reported back for this step
+	TaskID int64  `json:"task_id,omitempty"` // links to AgentTask if one was created
 }
 
 // BestPracticeReport is the output of the best practices engine.

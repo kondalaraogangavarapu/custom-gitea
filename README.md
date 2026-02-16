@@ -129,13 +129,14 @@ graph LR
         Agents["Agents<br/>AI task creation + history"]
         Practices["Practices<br/>Score analysis"]
         Docs["Documents<br/>AI-generated docs"]
+        Workflows["Workflows<br/>Plain-English CI/CD"]
         NewRepo["NewRepo<br/>Create form"]
     end
 
     subgraph Backend["Go Backend"]
         direction TB
         RouterB["api/router.go<br/>chi routes + handlers"]
-        Models["models/<br/>User, Repo, Task, Doc"]
+        Models["models/<br/>User, Repo, Task, Doc, Report"]
         GitEng["git/engine.go<br/>init, log, tree, blob"]
         AgentPkg["agent/<br/>Orchestrator, Claude, Bedrock"]
         BPEng["bestpractices/<br/>GitOps, SDLC, Cloud, Security"]
@@ -236,20 +237,11 @@ erDiagram
         int version
     }
 
-    PIPELINE {
-        int64 id PK
-        int64 repo_id FK
-        string name
-        string status
-        json stages
-    }
-
     USER ||--o{ REPOSITORY : owns
     REPOSITORY ||--o{ AGENT_TASK : has
     USER ||--o{ AGENT_TASK : creates
     REPOSITORY ||--o{ DOCUMENT : contains
     AGENT_TASK ||--o{ DOCUMENT : generates
-    REPOSITORY ||--o{ PIPELINE : runs
 ```
 
 ---
@@ -555,6 +547,12 @@ Flags:
 | GET | `/api/v1/repos/:owner/:repo/agent/tasks` | List agent tasks |
 | GET | `/api/v1/repos/:owner/:repo/documents` | List documents |
 | GET | `/api/v1/repos/:owner/:repo/practices` | Analyze best practices |
+| GET | `/api/v1/repos/:owner/:repo/workflows/file` | Read workflow file (.aetherdev/workflows.md) |
+| PUT | `/api/v1/repos/:owner/:repo/workflows/file` | Save workflow file (plain-English CI/CD steps) |
+| GET | `/api/v1/repos/:owner/:repo/workflows/runs` | List workflow run history |
+| POST | `/api/v1/repos/:owner/:repo/workflows/runs` | Create a workflow run record |
+| GET | `/api/v1/repos/:owner/:repo/workflows/runs/:id` | Get workflow run detail with step results |
+| PUT | `/api/v1/repos/:owner/:repo/workflows/runs/:id` | Update workflow run status and results |
 | GET | `/api/v1/health` | Health check |
 | GET | `/api/v1/version` | Version info |
 
