@@ -1,0 +1,17 @@
+services:
+  aetherdev:
+    build: .
+    container_name: aetherdev
+    ports:
+      - "3000:3000"
+    volumes:
+      - aetherdev-data:/home/aetherdev/data
+    environment:
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY:-}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_AGENT_ID=${AWS_AGENT_ID:-}
+      - AWS_AGENT_ALIAS_ID=${AWS_AGENT_ALIAS_ID:-}
+    restart: unless-stopped
+
+volumes:
+  aetherdev-data:
