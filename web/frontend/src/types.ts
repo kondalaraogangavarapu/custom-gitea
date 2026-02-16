@@ -96,6 +96,11 @@ export interface StepResult {
   task_id?: number
 }
 
+export interface AuthInfo {
+  user: User
+  oidc_enabled: boolean
+}
+
 export interface PracticeItem {
   rule: string
   description: string

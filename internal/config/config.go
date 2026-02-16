@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -10,6 +11,7 @@ import (
 type Config struct {
 	Server   ServerConfig   `yaml:"server"`
 	DataDir  string         `yaml:"data_dir"`
+	Auth     AuthConfig     `yaml:"auth"`
 	Agent    AgentConfig    `yaml:"agent"`
 	Cloud    CloudConfig    `yaml:"cloud"`
 	Branding BrandingConfig `yaml:"branding"`
@@ -19,6 +21,18 @@ type ServerConfig struct {
 	Port      int    `yaml:"port"`
 	Host      string `yaml:"host"`
 	SecretKey string `yaml:"secret_key"`
+	BaseURL   string `yaml:"base_url"` // e.g. https://aetherdev.example.com — used for OIDC redirect URI
+}
+
+// AuthConfig configures authentication. When OIDC is enabled, users log in via
+// their company's identity provider. When disabled, the v1 default admin is used.
+type AuthConfig struct {
+	OIDCEnabled  bool   `yaml:"oidc_enabled"`
+	IssuerURL    string `yaml:"issuer_url"`     // e.g. https://accounts.google.com or https://login.microsoftonline.com/{tenant}/v2.0
+	ClientID     string `yaml:"client_id"`
+	ClientSecret string `yaml:"client_secret"`
+	// Scopes defaults to "openid profile email" if empty.
+	Scopes []string `yaml:"scopes"`
 }
 
 type AgentConfig struct {
@@ -95,4 +109,21 @@ func (c *Config) RepoRootPath() string {
 
 func (c *Config) DBPath() string {
 	return filepath.Join(c.DataDir, "aetherdev.db")
+}
+
+// OIDCRedirectURI returns the callback URL the IdP should redirect to.
+func (c *Config) OIDCRedirectURI() string {
+	base := c.Server.BaseURL
+	if base == "" {
+		base = fmt.Sprintf("http://localhost:%d", c.Server.Port)
+	}
+	return base + "/auth/callback"
+}
+
+// OIDCScopes returns the scopes to request, defaulting to "openid profile email".
+func (c *Config) OIDCScopes() []string {
+	if len(c.Auth.Scopes) > 0 {
+		return c.Auth.Scopes
+	}
+	return []string{"openid", "profile", "email"}
 }

@@ -105,6 +105,12 @@ func (s *Store) migrate() error {
 			completed_at DATETIME,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
+		`CREATE TABLE IF NOT EXISTS sessions (
+			id TEXT PRIMARY KEY,
+			user_id INTEGER NOT NULL REFERENCES users(id),
+			expires_at DATETIME NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
 		// Seed a default admin user for v1
 		`INSERT OR IGNORE INTO users (id, username, email, full_name, is_admin)
 		 VALUES (1, 'admin', 'admin@aetherdev.local', 'Administrator', 1)`,
@@ -341,4 +347,71 @@ func (s *Store) ListWorkflowRuns(repoID int64) ([]WorkflowRun, error) {
 		runs = append(runs, r)
 	}
 	return runs, nil
+}
+
+// --- Session operations ---
+
+func (s *Store) CreateSession(id string, userID int64, expiresAt time.Time) error {
+	_, err := s.db.Exec(
+		`INSERT INTO sessions (id, user_id, expires_at) VALUES (?,?,?)`,
+		id, userID, expiresAt,
+	)
+	return err
+}
+
+func (s *Store) GetSession(id string) (int64, error) {
+	var userID int64
+	var expiresAt time.Time
+	err := s.db.QueryRow(
+		`SELECT user_id, expires_at FROM sessions WHERE id=?`, id,
+	).Scan(&userID, &expiresAt)
+	if err != nil {
+		return 0, err
+	}
+	if time.Now().After(expiresAt) {
+		s.db.Exec(`DELETE FROM sessions WHERE id=?`, id)
+		return 0, fmt.Errorf("session expired")
+	}
+	return userID, nil
+}
+
+func (s *Store) DeleteSession(id string) error {
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE id=?`, id)
+	return err
+}
+
+// UpsertUserByEmail creates or updates a user matched by email.
+// Used during OIDC login to provision users on first sign-in.
+func (s *Store) UpsertUserByEmail(email, username, fullName, avatarURL string) (*User, error) {
+	// Try update first
+	res, err := s.db.Exec(
+		`UPDATE users SET username=?, full_name=?, avatar_url=?, updated_at=CURRENT_TIMESTAMP WHERE email=?`,
+		username, fullName, avatarURL, email,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		return s.GetUserByEmail(email)
+	}
+	// Insert new user
+	_, err = s.db.Exec(
+		`INSERT INTO users (username, email, full_name, avatar_url, is_admin) VALUES (?,?,?,?,0)`,
+		username, email, fullName, avatarURL,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return s.GetUserByEmail(email)
+}
+
+func (s *Store) GetUserByEmail(email string) (*User, error) {
+	u := &User{}
+	err := s.db.QueryRow(
+		`SELECT id, username, email, full_name, avatar_url, is_admin, created_at, updated_at FROM users WHERE email=?`, email,
+	).Scan(&u.ID, &u.Username, &u.Email, &u.FullName, &u.AvatarURL, &u.IsAdmin, &u.CreatedAt, &u.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
 }

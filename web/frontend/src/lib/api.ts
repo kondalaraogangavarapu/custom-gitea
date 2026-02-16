@@ -8,6 +8,7 @@ import type {
   BestPracticeReport,
   WorkflowRun,
   StepResult,
+  AuthInfo,
 } from '../types'
 
 const BASE = '/api/v1'
@@ -117,6 +118,11 @@ export const workflows = {
 export const practices = {
   analyze: (owner: string, repo: string) =>
     request<BestPracticeReport>(`/repos/${owner}/${repo}/practices`),
+}
+
+// Auth
+export const auth = {
+  me: () => request<AuthInfo>('/auth/me'),
 }
 
 // System

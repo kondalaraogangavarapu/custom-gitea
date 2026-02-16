@@ -2,11 +2,13 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"html/template"
 	"log"
 	"net/http"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -17,6 +19,7 @@ import (
 	"github.com/aetherdev/aetherdev/internal/git"
 	"github.com/aetherdev/aetherdev/internal/middleware"
 	"github.com/aetherdev/aetherdev/internal/models"
+	"github.com/aetherdev/aetherdev/internal/oidc"
 )
 
 // Handler holds all dependencies for request handling.
@@ -26,6 +29,7 @@ type Handler struct {
 	gitEngine    *git.Engine
 	orchestrator *agent.Orchestrator
 	bpEngine     *bestpractices.Engine
+	oidcClient   *oidc.Client // nil when OIDC is disabled
 	templates    *template.Template
 }
 
@@ -51,6 +55,23 @@ func NewRouter(cfg *config.Config) (http.Handler, error) {
 	orchestrator := agent.NewOrchestrator(claudeAgent, bedrockAgent, store)
 	bpEngine := bestpractices.NewEngine()
 
+	// OIDC setup (optional — when not configured, falls back to default admin)
+	var oidcClient *oidc.Client
+	if cfg.Auth.OIDCEnabled && cfg.Auth.IssuerURL != "" {
+		oidcClient, err = oidc.NewClient(
+			cfg.Auth.IssuerURL,
+			cfg.Auth.ClientID,
+			cfg.Auth.ClientSecret,
+			cfg.OIDCRedirectURI(),
+			cfg.OIDCScopes(),
+		)
+		if err != nil {
+			log.Printf("Warning: OIDC discovery failed (auth will fall back to default admin): %v", err)
+		} else {
+			log.Printf("OIDC enabled: issuer=%s", cfg.Auth.IssuerURL)
+		}
+	}
+
 	tmpl, err := template.ParseGlob("web/templates/**/*.html")
 	if err != nil {
 		log.Printf("Warning: could not parse templates: %v", err)
@@ -63,8 +84,12 @@ func NewRouter(cfg *config.Config) (http.Handler, error) {
 		gitEngine:    gitEngine,
 		orchestrator: orchestrator,
 		bpEngine:     bpEngine,
+		oidcClient:   oidcClient,
 		templates:    tmpl,
 	}
+
+	// Build the session auth middleware with store + OIDC awareness
+	sessionAuth := middleware.NewSessionAuth(store, cfg.Auth.OIDCEnabled && oidcClient != nil)
 
 	r := chi.NewRouter()
 
@@ -80,9 +105,21 @@ func NewRouter(cfg *config.Config) (http.Handler, error) {
 	// SPA assets (Vite build output served from /assets/)
 	r.Handle("/assets/*", http.StripPrefix("/", http.FileServer(http.Dir("web/static/dist"))))
 
+	// Auth routes (no session required)
+	r.Get("/auth/login", h.authLogin)
+	r.Get("/auth/callback", h.authCallback)
+	r.Get("/auth/logout", h.authLogout)
+	r.Get("/auth/login-page", h.serveSPA) // SPA renders the login page
+
+	// Current user API (needs session but returns 401 instead of redirect)
+	r.Route("/api/v1/auth", func(r chi.Router) {
+		r.Use(sessionAuth)
+		r.Get("/me", h.apiAuthMe)
+	})
+
 	// Pages (HTML) — serve SPA index.html as fallback for all routes
 	r.Group(func(r chi.Router) {
-		r.Use(middleware.SessionAuth)
+		r.Use(sessionAuth)
 		r.Get("/", h.serveSPA)
 		r.Get("/new", h.serveSPA)
 		r.Get("/{owner}/{repo}", h.serveSPA)
@@ -97,7 +134,7 @@ func NewRouter(cfg *config.Config) (http.Handler, error) {
 
 	// API (JSON)
 	r.Route("/api/v1", func(r chi.Router) {
-		r.Use(middleware.SessionAuth)
+		r.Use(sessionAuth)
 
 		// Repositories
 		r.Get("/repos", h.apiListRepos)
@@ -364,6 +401,180 @@ func (h *Handler) apiAnalyzePractices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, report)
+}
+
+// --- Auth Handlers ---
+
+const sessionCookieName = "aetherdev_session"
+
+// authLogin redirects the browser to the IdP's authorization endpoint.
+func (h *Handler) authLogin(w http.ResponseWriter, r *http.Request) {
+	if h.oidcClient == nil {
+		// OIDC not configured — just set a session for the default admin
+		h.setAdminSession(w)
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+
+	state, err := oidc.GenerateState()
+	if err != nil {
+		http.Error(w, "failed to generate state", http.StatusInternalServerError)
+		return
+	}
+
+	// Store state in a short-lived cookie for CSRF verification
+	http.SetCookie(w, &http.Cookie{
+		Name:     "oidc_state",
+		Value:    state,
+		Path:     "/",
+		MaxAge:   300, // 5 minutes
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	http.Redirect(w, r, h.oidcClient.AuthURL(state), http.StatusFound)
+}
+
+// authCallback handles the IdP redirect after the user authenticates.
+func (h *Handler) authCallback(w http.ResponseWriter, r *http.Request) {
+	if h.oidcClient == nil {
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+
+	// Verify state
+	stateCookie, err := r.Cookie("oidc_state")
+	if err != nil || stateCookie.Value != r.URL.Query().Get("state") {
+		http.Error(w, "invalid state parameter", http.StatusBadRequest)
+		return
+	}
+	// Clear the state cookie
+	http.SetCookie(w, &http.Cookie{Name: "oidc_state", Path: "/", MaxAge: -1})
+
+	// Check for error from IdP
+	if errMsg := r.URL.Query().Get("error"); errMsg != "" {
+		desc := r.URL.Query().Get("error_description")
+		http.Error(w, fmt.Sprintf("IdP error: %s — %s", errMsg, desc), http.StatusBadRequest)
+		return
+	}
+
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		http.Error(w, "no authorization code", http.StatusBadRequest)
+		return
+	}
+
+	// Exchange code for tokens
+	tok, err := h.oidcClient.Exchange(code)
+	if err != nil {
+		log.Printf("OIDC token exchange failed: %v", err)
+		http.Error(w, "authentication failed", http.StatusInternalServerError)
+		return
+	}
+
+	// Fetch user info
+	userInfo, err := h.oidcClient.FetchUserInfo(tok.AccessToken)
+	if err != nil {
+		log.Printf("OIDC userinfo failed: %v", err)
+		http.Error(w, "failed to fetch user info", http.StatusInternalServerError)
+		return
+	}
+
+	if userInfo.Email == "" {
+		http.Error(w, "IdP did not return an email address", http.StatusBadRequest)
+		return
+	}
+
+	// Provision or update user
+	username := userInfo.PreferredUsername
+	if username == "" {
+		username = strings.Split(userInfo.Email, "@")[0]
+	}
+	user, err := h.store.UpsertUserByEmail(userInfo.Email, username, userInfo.Name, userInfo.Picture)
+	if err != nil {
+		log.Printf("User upsert failed: %v", err)
+		http.Error(w, "failed to provision user", http.StatusInternalServerError)
+		return
+	}
+
+	// Create session
+	sessionID, err := oidc.GenerateSessionID()
+	if err != nil {
+		http.Error(w, "failed to create session", http.StatusInternalServerError)
+		return
+	}
+	expiresAt := time.Now().Add(24 * time.Hour)
+	if err := h.store.CreateSession(sessionID, user.ID, expiresAt); err != nil {
+		http.Error(w, "failed to save session", http.StatusInternalServerError)
+		return
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    sessionID,
+		Path:     "/",
+		MaxAge:   86400, // 24 hours
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+// authLogout clears the session and optionally redirects to IdP logout.
+func (h *Handler) authLogout(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err == nil {
+		h.store.DeleteSession(cookie.Value)
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:   sessionCookieName,
+		Path:   "/",
+		MaxAge: -1,
+	})
+
+	if h.oidcClient != nil {
+		base := h.cfg.Server.BaseURL
+		if base == "" {
+			base = fmt.Sprintf("http://localhost:%d", h.cfg.Server.Port)
+		}
+		http.Redirect(w, r, h.oidcClient.LogoutURL(base), http.StatusFound)
+		return
+	}
+
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+// setAdminSession creates a session for the default admin user (OIDC disabled).
+func (h *Handler) setAdminSession(w http.ResponseWriter) {
+	sessionID, err := oidc.GenerateSessionID()
+	if err != nil {
+		return
+	}
+	h.store.CreateSession(sessionID, 1, time.Now().Add(24*time.Hour))
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    sessionID,
+		Path:     "/",
+		MaxAge:   86400,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+// apiAuthMe returns the current authenticated user.
+func (h *Handler) apiAuthMe(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value(middleware.UserIDKey).(int64)
+	user, err := h.store.GetUser(userID)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "user not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"user":         user,
+		"oidc_enabled": h.oidcClient != nil,
+	})
 }
 
 // --- Page Handlers (HTML) ---

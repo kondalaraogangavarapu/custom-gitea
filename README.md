@@ -1,6 +1,6 @@
 # AetherDev
 
-A self-hosted Git repository management platform with built-in AI agent capabilities. AetherDev combines Gitea-style repository hosting with AI-powered code review, generation, documentation, and best practice analysis via Anthropic Claude and AWS Bedrock.
+A self-hosted Git repository management platform with built-in AI agent capabilities. AetherDev combines Gitea-style repository hosting with AI-powered code review, generation, documentation, and best practice analysis via Anthropic Claude and AWS Bedrock. Designed for enterprise teams with OIDC/SSO authentication and plain-English CI/CD workflows.
 
 ## Tech Stack
 
@@ -10,6 +10,7 @@ A self-hosted Git repository management platform with built-in AI agent capabili
 | Frontend | React 18, TypeScript, Vite 7, Tailwind CSS v4 |
 | Data Fetching | TanStack React Query |
 | AI Agents | Anthropic Claude API, AWS Bedrock |
+| Authentication | OIDC Authorization Code Flow (any OpenID Connect provider) |
 | Icons | Lucide React |
 
 ## Architecture
@@ -24,8 +25,9 @@ graph TB
 
     subgraph Server["Go Backend (:3000)"]
         Router["chi/v5 Router"]
-        MW["Middleware<br/>Auth | CORS | Logger | Recovery"]
+        MW["Middleware<br/>SessionAuth | CORS | Logger | Recovery"]
         API["REST API /api/v1"]
+        AuthRoutes["Auth Routes<br/>/auth/login | callback | logout"]
         SPAServe["SPA File Server"]
     end
 
@@ -33,6 +35,7 @@ graph TB
         Git["Git Engine<br/>(go-git / bare repos)"]
         Store["SQLite3 Store<br/>(WAL mode)"]
         BP["Best Practices<br/>Engine"]
+        OIDC["OIDC Client<br/>(Discovery + Auth Code Flow)"]
     end
 
     subgraph AI["AI Agent Layer"]
@@ -46,10 +49,18 @@ graph TB
         Repos[("Git Bare<br/>Repositories")]
     end
 
+    subgraph IdP["Identity Provider"]
+        IDP["Company IdP<br/>(Okta, Azure AD, Google, etc.)"]
+    end
+
     SPA -->|"fetch /api/v1/*"| Router
     SPA -->|"GET /*"| SPAServe
     Router --> MW --> API
+    Router --> AuthRoutes
     Router --> SPAServe
+
+    AuthRoutes --> OIDC
+    OIDC -->|".well-known/openid-configuration"| IDP
 
     API --> Git
     API --> Store
@@ -63,6 +74,43 @@ graph TB
     Git --> Repos
     Store --> DB
     BP --> Repos
+```
+
+### Authentication Flow (OIDC)
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant S as AetherDev Server
+    participant IdP as Company IdP
+
+    B->>S: GET / (no session cookie)
+    S->>B: 302 Redirect → /auth/login-page
+    B->>S: GET /auth/login-page
+    S->>B: SPA Login page
+
+    B->>S: Click "Sign in with SSO" → GET /auth/login
+    S->>S: Generate state + set oidc_state cookie
+    S->>B: 302 Redirect → IdP authorization endpoint
+
+    B->>IdP: User authenticates
+    IdP->>B: 302 Redirect → /auth/callback?code=...&state=...
+
+    B->>S: GET /auth/callback?code=...&state=...
+    S->>S: Verify state cookie
+    S->>IdP: POST /token (exchange code for tokens)
+    IdP-->>S: access_token, id_token
+    S->>IdP: GET /userinfo (fetch user claims)
+    IdP-->>S: email, name, preferred_username, picture
+
+    S->>S: UpsertUserByEmail (provision/update user)
+    S->>S: CreateSession (24h expiry)
+    S->>B: Set aetherdev_session cookie + 302 → /
+
+    Note over B,S: Subsequent requests include session cookie
+    B->>S: GET /api/v1/repos (with cookie)
+    S->>S: SessionAuth middleware validates session
+    S-->>B: JSON response
 ```
 
 ### Request Flow
@@ -79,6 +127,8 @@ sequenceDiagram
     participant A as AI Orchestrator
 
     B->>R: GET / (any client route)
+    R->>M: SessionAuth middleware (validate cookie)
+    M->>R: user_id in context
     R->>B: index.html (SPA shell)
     B->>V: Load React app + assets
 
@@ -123,25 +173,27 @@ graph LR
     end
 
     subgraph PagesDetail["Pages"]
+        Login["Login<br/>SSO sign-in"]
         Dashboard["Dashboard<br/>Repo grid + stats"]
         Repo["Repository<br/>File tree browser"]
         Blob["BlobViewer<br/>Source code viewer"]
         Agents["Agents<br/>AI task creation + history"]
         Practices["Practices<br/>Score analysis"]
         Docs["Documents<br/>AI-generated docs"]
-        Workflows["Workflows<br/>Plain-English CI/CD"]
+        Workflows["Workflows<br/>Plain-English CI/CD + Run History"]
         NewRepo["NewRepo<br/>Create form"]
     end
 
     subgraph Backend["Go Backend"]
         direction TB
         RouterB["api/router.go<br/>chi routes + handlers"]
-        Models["models/<br/>User, Repo, Task, Doc, Report"]
-        GitEng["git/engine.go<br/>init, log, tree, blob"]
+        Models["models/<br/>User, Repo, Task, Doc, WorkflowRun"]
+        GitEng["git/engine.go<br/>init, log, tree, blob, writeFile"]
         AgentPkg["agent/<br/>Orchestrator, Claude, Bedrock"]
         BPEng["bestpractices/<br/>GitOps, SDLC, Cloud, Security"]
-        Config["config/<br/>YAML loader"]
-        MWPkg["middleware/<br/>Auth, CORS, Logger"]
+        OIDCPkg["oidc/<br/>Discovery, Auth Code Flow"]
+        Config["config/<br/>YAML loader + AuthConfig"]
+        MWPkg["middleware/<br/>SessionAuth, CORS, Logger"]
     end
 
     Pages -.-> PagesDetail
@@ -150,6 +202,7 @@ graph LR
     RouterB --> GitEng
     RouterB --> AgentPkg
     RouterB --> BPEng
+    RouterB --> OIDCPkg
 ```
 
 ### Deployment Architecture (Docker)
@@ -175,9 +228,10 @@ graph TB
         end
     end
 
-    subgraph External["External APIs"]
+    subgraph External["External Services"]
         Anthropic["Anthropic API<br/>Claude"]
         AWS["AWS Bedrock"]
+        IdP["Company IdP<br/>(OIDC Provider)"]
     end
 
     User -->|HTTPS| SSL
@@ -186,6 +240,7 @@ graph TB
     App --> Data
     App -->|API calls| Anthropic
     App -->|SDK calls| AWS
+    App -->|OIDC flow| IdP
 ```
 
 ### Data Model
@@ -197,7 +252,15 @@ erDiagram
         string username
         string email
         string full_name
+        string avatar_url
         bool is_admin
+        timestamp created_at
+    }
+
+    SESSION {
+        string id PK
+        int64 user_id FK
+        timestamp expires_at
         timestamp created_at
     }
 
@@ -237,11 +300,27 @@ erDiagram
         int version
     }
 
+    WORKFLOW_RUN {
+        int64 id PK
+        int64 repo_id FK
+        int64 user_id FK
+        string triggered_by
+        string section
+        string status
+        json step_results
+        string summary
+        timestamp started_at
+        timestamp completed_at
+    }
+
+    USER ||--o{ SESSION : authenticates
     USER ||--o{ REPOSITORY : owns
     REPOSITORY ||--o{ AGENT_TASK : has
     USER ||--o{ AGENT_TASK : creates
     REPOSITORY ||--o{ DOCUMENT : contains
     AGENT_TASK ||--o{ DOCUMENT : generates
+    REPOSITORY ||--o{ WORKFLOW_RUN : tracks
+    USER ||--o{ WORKFLOW_RUN : triggers
 ```
 
 ---
@@ -279,15 +358,27 @@ This compiles the React SPA into `web/static/dist/`, which the Go server serves.
 
 ### 3. Configure (optional)
 
-Create an `aetherdev.yaml` in the project root. The app works without it using defaults.
+Create an `aetherdev.yaml` in the project root. The app works without it using defaults (no OIDC, default admin user).
 
 ```yaml
 server:
   port: 3000
   host: 0.0.0.0
   secret_key: change-me-in-production
+  base_url: https://aetherdev.example.com  # Required for OIDC redirect URI
 
 data_dir: ./data
+
+# Enterprise SSO — supply your company's OIDC provider details
+auth:
+  oidc_enabled: true
+  issuer_url: https://accounts.google.com              # or your company IdP
+  client_id: your-client-id
+  client_secret: your-client-secret
+  scopes:                                               # optional, defaults below
+    - openid
+    - profile
+    - email
 
 agent:
   claude_api_key: ${CLAUDE_API_KEY}
@@ -341,6 +432,91 @@ npm run dev
 The Vite dev server runs at **http://localhost:5173** with:
 - Hot Module Replacement (HMR) for instant UI updates
 - Automatic API proxy to the Go backend on port 3000
+
+---
+
+## Enterprise SSO (OIDC)
+
+AetherDev supports OpenID Connect for enterprise single sign-on. Supply your company's `.well-known` discovery URL and AetherDev handles the rest — user provisioning, session management, and logout.
+
+### Supported Providers
+
+Any OIDC-compliant identity provider works, including:
+
+| Provider | Issuer URL Example |
+|----------|-------------------|
+| Google Workspace | `https://accounts.google.com` |
+| Microsoft Entra ID | `https://login.microsoftonline.com/{tenant}/v2.0` |
+| Okta | `https://{domain}.okta.com` |
+| Auth0 | `https://{domain}.auth0.com/` |
+| Keycloak | `https://{host}/realms/{realm}` |
+| GitLab | `https://gitlab.com` |
+
+### Setup Steps
+
+1. Register AetherDev as an application in your IdP
+2. Set the **redirect URI** to `https://your-domain.com/auth/callback`
+3. Note the **client ID** and **client secret**
+4. Add the config to `aetherdev.yaml`:
+
+```yaml
+server:
+  base_url: https://aetherdev.example.com
+
+auth:
+  oidc_enabled: true
+  issuer_url: https://login.microsoftonline.com/{tenant}/v2.0
+  client_id: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+  client_secret: your-secret
+```
+
+### How It Works
+
+- AetherDev fetches `{issuer_url}/.well-known/openid-configuration` at startup to auto-discover all endpoints (authorization, token, userinfo, logout)
+- Users clicking "Sign in with SSO" are redirected to the IdP
+- After authentication, the IdP redirects back with an authorization code
+- AetherDev exchanges the code for tokens, fetches user info, and creates/updates the user record
+- A 24-hour session cookie (`aetherdev_session`) is set
+- When OIDC is disabled (default), all requests use the built-in admin user for backward compatibility
+
+---
+
+## Workflows
+
+AetherDev takes a file-first approach to CI/CD. Instead of YAML pipelines or scripted configurations, workflows are written as **plain English** in a Markdown file committed to the repository at `.aetherdev/workflows.md`.
+
+AI agents read and execute these instructions in isolated sandboxes. There is no special syntax — agents understand English.
+
+### Example Workflow File
+
+```markdown
+# AetherDev Workflows
+
+## On every pull request
+1. Run the full test suite with coverage
+2. Check for linting errors and auto-fix if possible
+3. Generate a code review summary
+
+## Before release
+1. Run security audit on all dependencies
+2. Build Docker image and tag it with the version number
+3. Run integration tests against staging
+4. Generate release notes from recent commits
+
+## Nightly maintenance
+1. Check for outdated dependencies and open a PR if updates are available
+2. Run the full best practices analysis
+3. Clean up stale branches older than 30 days
+```
+
+### Workflow Run Tracking
+
+Every workflow execution is tracked for observability:
+- **Who triggered it** — username or agent that initiated the run
+- **Which section** — which `## ` heading from the workflow file was executed
+- **Step-by-step results** — status and output for each numbered step
+- **Live status** — pending, running, completed, or failed
+- **Full history** — browse all past runs from the Workflows page
 
 ---
 
@@ -511,16 +687,17 @@ Flags:
 │   ├── agent/              # AI agent orchestration (Claude, Bedrock)
 │   ├── api/                # HTTP router, handlers, SPA serving
 │   ├── bestpractices/      # Code quality analysis engine
-│   ├── config/             # YAML configuration loader
-│   ├── git/                # Git bare repository operations
-│   ├── middleware/          # HTTP middleware (auth, CORS, logging)
-│   └── models/             # Data models and SQLite store
+│   ├── config/             # YAML configuration loader (server, auth, agent)
+│   ├── git/                # Git bare repository operations (read + write)
+│   ├── middleware/          # HTTP middleware (session auth, CORS, logging)
+│   ├── models/             # Data models and SQLite store
+│   └── oidc/               # OpenID Connect client (discovery, auth code flow)
 ├── web/
 │   ├── frontend/           # Vite + React + TypeScript SPA
 │   │   ├── src/
 │   │   │   ├── components/ # Layout, Sidebar, Header
-│   │   │   ├── pages/      # Dashboard, Repository, Agents, etc.
-│   │   │   ├── lib/        # API client
+│   │   │   ├── pages/      # Login, Dashboard, Repository, Agents, Workflows, etc.
+│   │   │   ├── lib/        # API client (auth, repos, agents, workflows)
 │   │   │   └── types.ts    # TypeScript interfaces
 │   │   ├── package.json
 │   │   └── vite.config.ts
@@ -534,6 +711,18 @@ Flags:
 
 ## API Endpoints
 
+### Authentication
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/auth/login` | Initiate OIDC login (redirects to IdP) |
+| GET | `/auth/callback` | OIDC callback (exchanges code for session) |
+| GET | `/auth/logout` | Clear session and redirect to IdP logout |
+| GET | `/auth/login-page` | Serve SPA login page |
+| GET | `/api/v1/auth/me` | Get current authenticated user |
+
+### Repositories
+
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/v1/repos` | List repositories |
@@ -543,16 +732,41 @@ Flags:
 | GET | `/api/v1/repos/:owner/:repo/commits/:ref` | List commits |
 | GET | `/api/v1/repos/:owner/:repo/tree/:ref/*` | List file tree |
 | GET | `/api/v1/repos/:owner/:repo/blob/:ref/*` | Read file content |
+
+### AI Agents
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
 | POST | `/api/v1/repos/:owner/:repo/agent/tasks` | Create AI agent task |
 | GET | `/api/v1/repos/:owner/:repo/agent/tasks` | List agent tasks |
+
+### Documents
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
 | GET | `/api/v1/repos/:owner/:repo/documents` | List documents |
+
+### Best Practices
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
 | GET | `/api/v1/repos/:owner/:repo/practices` | Analyze best practices |
-| GET | `/api/v1/repos/:owner/:repo/workflows/file` | Read workflow file (.aetherdev/workflows.md) |
+
+### Workflows
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/v1/repos/:owner/:repo/workflows/file` | Read workflow file (`.aetherdev/workflows.md`) |
 | PUT | `/api/v1/repos/:owner/:repo/workflows/file` | Save workflow file (plain-English CI/CD steps) |
 | GET | `/api/v1/repos/:owner/:repo/workflows/runs` | List workflow run history |
 | POST | `/api/v1/repos/:owner/:repo/workflows/runs` | Create a workflow run record |
 | GET | `/api/v1/repos/:owner/:repo/workflows/runs/:id` | Get workflow run detail with step results |
 | PUT | `/api/v1/repos/:owner/:repo/workflows/runs/:id` | Update workflow run status and results |
+
+### System
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
 | GET | `/api/v1/health` | Health check |
 | GET | `/api/v1/version` | Version info |
 
