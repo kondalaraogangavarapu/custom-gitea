@@ -1,0 +1,46 @@
+# Binaries
+/aetherdev
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Build
+/dist/
+/build/
+
+# Data
+/data/
+*.db
+*.sqlite3
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+/logs/
+
+# Node modules (for frontend tooling)
+node_modules/
+
+# Frontend build output
+web/static/dist/
+
+# Temporary
+/tmp/
